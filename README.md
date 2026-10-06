@@ -4,10 +4,6 @@ A working sample of AI automation tooling for Claude Code: an MCP server for Mic
 
 It is a curated subset of a private repository used for client work at TruNXT. Client material and third-party skills were left out. What remains is working code, documented with its limits.
 
-![How the pieces fit](docs/architecture.png)
-
-Editable diagram source: [`docs/architecture.excalidraw`](docs/architecture.excalidraw).
-
 ## What is here
 
 | Path | What it is |
@@ -22,6 +18,10 @@ Editable diagram source: [`docs/architecture.excalidraw`](docs/architecture.exca
 ## M365 server
 
 The server signs in to a tenant as an application, using a certificate. Credentials are read from Bitwarden Secrets Manager when the server starts and are never written to Claude Code's configuration.
+
+![How a tool call reaches the tenant](docs/architecture.png)
+
+Diagram source: [`docs/architecture.excalidraw`](docs/architecture.excalidraw).
 
 ```bash
 cd mcp-servers/m365-graph
