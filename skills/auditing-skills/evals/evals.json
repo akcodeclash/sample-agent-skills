@@ -1,0 +1,89 @@
+{
+  "skill_name": "auditing-skills",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Audit the skills in this repository and tell me if everything is set up correctly.",
+      "expected_output": "A structured audit report for the repository root. It counts every SKILL.md outside tests/, runs all seven checks, and lists each finding with its file. The fixtures under tests/ are not reported.",
+      "files": [],
+      "assertions": [
+        {
+          "text": "Report contains a Skills Audit header or section title",
+          "type": "output_contains"
+        },
+        {
+          "text": "Report states how many SKILL.md files were scanned, and the number matches the SKILL.md files outside tests/",
+          "type": "output_contains"
+        },
+        {
+          "text": "Report states the number of errors and the number of warnings",
+          "type": "output_contains"
+        },
+        {
+          "text": "Report covers all 7 check categories (name alignment, frontmatter fields, delimiters, stale refs, broken links, body completeness, body length)",
+          "type": "output_contains"
+        },
+        {
+          "text": "Report does not list any finding from tests/auditing/dirty-test-repo",
+          "type": "output_contains"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Audit the skills repo at tests/auditing/dirty-test-repo and report any issues you find.",
+      "expected_output": "A structured audit report identifying: 1 name/folder mismatch error (wrong-name folder vs totally-wrong name), 1 missing description error (no-description), 2 stale skill reference warnings (analyzing-data, generating-report), 1 broken link warning (references/nonexistent.md), and an incomplete-body warning for each of the four fixtures (each has fewer than 5 lines after the frontmatter).",
+      "files": [],
+      "assertions": [
+        {
+          "text": "Report identifies the name/folder mismatch in capabilities/wrong-name (name: totally-wrong vs folder: wrong-name)",
+          "type": "output_contains"
+        },
+        {
+          "text": "Report identifies missing description in patterns/no-description",
+          "type": "output_contains"
+        },
+        {
+          "text": "Report identifies stale reference to analyzing-data",
+          "type": "output_contains"
+        },
+        {
+          "text": "Report identifies stale reference to generating-report",
+          "type": "output_contains"
+        },
+        {
+          "text": "Report identifies broken link to references/nonexistent.md",
+          "type": "output_contains"
+        },
+        {
+          "text": "Report flags the fixtures as incomplete skill bodies (fewer than 5 lines of content)",
+          "type": "output_contains"
+        },
+        {
+          "text": "Report distinguishes errors from warnings (structural issues vs references/links)",
+          "type": "output_contains"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Check if everything in my skills folder is set up correctly. It's the repo I'm in.",
+      "expected_output": "A structured audit report for the repository root. Tests that the skill triggers from informal phrasing.",
+      "files": [],
+      "assertions": [
+        {
+          "text": "Report has structured audit format (not just a casual conversational response)",
+          "type": "output_contains"
+        },
+        {
+          "text": "Report states the number of errors and the number of warnings",
+          "type": "output_contains"
+        },
+        {
+          "text": "Report covers multiple check categories (not just one)",
+          "type": "output_contains"
+        }
+      ]
+    }
+  ]
+}

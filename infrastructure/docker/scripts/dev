@@ -1,0 +1,414 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────
+# dev — Docker client manager
+#
+# Manages per-client Docker environments for AI agent development.
+# Each client has isolated Postgres + Redis with unique ports/volumes.
+#
+# USAGE:
+#   dev up acme-corp          Start a client's services
+#   dev down acme-corp        Stop a client's services
+#   dev status                Show all running client services
+#   dev new acme-corp         Create Docker env + project folder + .env.local
+#   dev logs acme-corp        Follow logs for a client
+#   dev db acme-corp          Open psql for a client
+#   dev redis acme-corp       Open redis-cli for a client
+#   dev nuke acme-corp        Remove all containers + volumes for a client
+#   dev ports                 Show port assignments across all clients
+#   dev open acme-corp        Open project folder in VS Code
+# ─────────────────────────────────────────────────────────────
+
+set -euo pipefail
+
+CLIENTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../clients" && pwd)"
+TEMPLATE_DIR="$CLIENTS_DIR/template"
+
+# ── Config ────────────────────────────────────────────────────
+# Root folder where all client workspaces live.
+# Change this if you use a different folder (e.g. ~/code or ~/work).
+PROJECTS_ROOT="${HOME}/clients"
+
+# ── Colors ────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+# ── Helpers ───────────────────────────────────────────────────
+info()    { echo -e "${BLUE}▸${RESET} $*"; }
+success() { echo -e "${GREEN}✓${RESET} $*"; }
+warn()    { echo -e "${YELLOW}⚠${RESET} $*"; }
+error()   { echo -e "${RED}✗${RESET} $*" >&2; exit 1; }
+
+require_client() {
+  local client="$1"
+  [[ -z "$client" ]] && error "Client name required"
+  [[ ! -d "$CLIENTS_DIR/$client" ]] && error "Client '$client' not found in $CLIENTS_DIR"
+  if [[ ! -f "$CLIENTS_DIR/$client/.env" ]]; then
+    error "No .env found for client '$client' — copy .env.example to .env"
+  fi
+}
+
+client_compose() {
+  local client="$1"
+  shift
+  docker compose \
+    --project-directory "$CLIENTS_DIR/$client" \
+    --env-file "$CLIENTS_DIR/$client/.env" \
+    -f "$CLIENTS_DIR/$client/docker-compose.yml" \
+    "$@"
+}
+
+load_env() {
+  local client="$1"
+  # shellcheck disable=SC1090
+  set -a; source "$CLIENTS_DIR/$client/.env"; set +a
+}
+
+# ── Commands ──────────────────────────────────────────────────
+
+cmd_up() {
+  local client="$1"
+  require_client "$client"
+  info "Starting services for ${BOLD}$client${RESET}..."
+  client_compose "$client" up -d
+  echo ""
+  load_env "$client"
+  success "Services running for ${BOLD}$client${RESET}"
+  echo -e "  ${CYAN}Postgres${RESET}  localhost:${POSTGRES_PORT}  db=${DB_NAME}  user=${DB_USER}"
+  echo -e "  ${CYAN}Redis${RESET}     localhost:${REDIS_PORT}"
+  echo ""
+  echo -e "  Connection strings:"
+  echo -e "  ${BOLD}DATABASE_URL${RESET}=${DATABASE_URL}"
+  echo -e "  ${BOLD}REDIS_URL${RESET}=${REDIS_URL}"
+}
+
+cmd_down() {
+  local client="$1"
+  require_client "$client"
+  info "Stopping services for ${BOLD}$client${RESET}..."
+  client_compose "$client" down
+  success "Services stopped for ${BOLD}$client${RESET} (data preserved)"
+}
+
+cmd_status() {
+  echo -e "\n${BOLD}Client Services Status${RESET}\n"
+  local found=0
+  for dir in "$CLIENTS_DIR"/*/; do
+    local client
+    client=$(basename "$dir")
+    [[ "$client" == "template" ]] && continue
+    [[ ! -f "$dir/.env" ]] && continue
+    found=1
+
+    load_env "$client"
+    local pg_status redis_status
+    pg_status=$(docker inspect --format='{{.State.Status}}' "${CLIENT_NAME}-postgres" 2>/dev/null || echo "stopped")
+    redis_status=$(docker inspect --format='{{.State.Status}}' "${CLIENT_NAME}-redis" 2>/dev/null || echo "stopped")
+
+    local pg_icon redis_icon
+    [[ "$pg_status" == "running" ]] && pg_icon="${GREEN}●${RESET}" || pg_icon="${RED}●${RESET}"
+    [[ "$redis_status" == "running" ]] && redis_icon="${GREEN}●${RESET}" || redis_icon="${RED}●${RESET}"
+
+    echo -e "  ${BOLD}$client${RESET}"
+    echo -e "    ${pg_icon} Postgres  :${POSTGRES_PORT}  (${pg_status})"
+    echo -e "    ${redis_icon} Redis     :${REDIS_PORT}  (${redis_status})"
+    echo ""
+  done
+  if [[ $found -eq 0 ]]; then
+    echo "  No clients configured yet. Run: dev new <client-name>"
+  fi
+}
+
+cmd_new() {
+  local client="$1"
+  [[ -z "$client" ]] && error "Client name required (e.g. dev new acme-corp)"
+
+  # Validate name format
+  if [[ ! "$client" =~ ^[a-z0-9-]+$ ]]; then
+    error "Client name must be lowercase letters, numbers, and hyphens only"
+  fi
+
+  local client_dir="$CLIENTS_DIR/$client"
+  local project_dir="$PROJECTS_ROOT/$client"
+  [[ -d "$client_dir" ]] && error "Client '$client' already exists in docker clients"
+
+  info "Creating new client: ${BOLD}$client${RESET}"
+
+  # ── Auto-assign ports ────────────────────────────────────────
+  local client_count
+  client_count=$(find "$CLIENTS_DIR" -maxdepth 1 -mindepth 1 -type d -not -name "template" | wc -l | tr -d ' ')
+  local pg_port=$((5433 + client_count * 10))
+  local redis_port=$((6380 + client_count * 10))
+  local db_name="${client//-/_}_dev"
+  local db_password="${client}-local-dev"
+  local redis_password="${client}-redis-dev"
+  local database_url="postgresql://dev:${db_password}@localhost:${pg_port}/${db_name}"
+  local redis_url="redis://:${redis_password}@localhost:${redis_port}"
+
+  # ── 1. Create Docker client folder ──────────────────────────
+  mkdir -p "$client_dir"
+  cp "$TEMPLATE_DIR/docker-compose.yml" "$client_dir/docker-compose.yml"
+
+  cat > "$client_dir/.env.example" << EOF
+CLIENT_NAME=$client
+
+POSTGRES_PORT=$pg_port
+DB_USER=dev
+DB_PASSWORD=changeme
+DB_NAME=${db_name}
+
+DATABASE_URL=postgresql://dev:changeme@localhost:$pg_port/${db_name}
+
+REDIS_PORT=$redis_port
+REDIS_PASSWORD=changeme
+
+REDIS_URL=redis://:changeme@localhost:$redis_port
+EOF
+
+  cat > "$client_dir/.env" << EOF
+CLIENT_NAME=$client
+
+POSTGRES_PORT=$pg_port
+DB_USER=dev
+DB_PASSWORD=${db_password}
+DB_NAME=${db_name}
+
+DATABASE_URL=${database_url}
+
+REDIS_PORT=$redis_port
+REDIS_PASSWORD=${redis_password}
+
+REDIS_URL=${redis_url}
+EOF
+
+  # ── 2. Create project folder ─────────────────────────────────
+  if [[ -d "$project_dir" ]]; then
+    warn "Project folder already exists at $project_dir — skipping creation"
+  else
+    mkdir -p "$project_dir"
+    info "Created project folder: ${BOLD}$project_dir${RESET}"
+  fi
+
+  # ── 3. Write .env.local into project folder ──────────────────
+  local env_local="$project_dir/.env.local"
+
+  if [[ -f "$env_local" ]]; then
+    # File exists — append only if keys aren't already there
+    if grep -q "DATABASE_URL" "$env_local" 2>/dev/null; then
+      warn ".env.local already has DATABASE_URL — skipping (check $env_local manually)"
+    else
+      cat >> "$env_local" << EOF
+
+# ── Added by dev new $client ──────────────────────────────────
+DATABASE_URL=${database_url}
+REDIS_URL=${redis_url}
+EOF
+      info "Appended connection strings to existing .env.local"
+    fi
+  else
+    # Create fresh .env.local
+    cat > "$env_local" << EOF
+# ─────────────────────────────────────────────────────────────
+# Local environment — $client
+# Generated by: dev new $client
+# Never commit this file.
+# ─────────────────────────────────────────────────────────────
+
+# ── Database ──────────────────────────────────────────────────
+DATABASE_URL=${database_url}
+
+# ── Redis ─────────────────────────────────────────────────────
+REDIS_URL=${redis_url}
+
+# ── Trigger.dev ───────────────────────────────────────────────
+# Get this from: trigger.dev → project → API Keys
+TRIGGER_SECRET_KEY=
+
+# ── AI Providers ──────────────────────────────────────────────
+ANTHROPIC_API_KEY=
+# OPENAI_API_KEY=
+EOF
+    info "Created .env.local at ${BOLD}$env_local${RESET}"
+  fi
+
+  # ── 4. Create CLAUDE.md in project folder ────────────────────
+  local claude_md="$project_dir/CLAUDE.md"
+  if [[ ! -f "$claude_md" ]]; then
+    cat > "$claude_md" << EOF
+# $client
+
+## Stack
+- TypeScript
+- Trigger.dev v3 (tasks in src/trigger/)
+- PostgreSQL (local port: $pg_port)
+- Redis (local port: $redis_port)
+
+## Architecture
+[Describe the system here]
+
+## Conventions
+- All Trigger.dev tasks live in src/trigger/
+- Use zod for all input validation
+- Use structured logging in all tasks
+- Every task writes its results to Postgres for client audit visibility
+
+## Key Decisions
+[Record architectural decisions here so Claude has context]
+
+## Local Dev
+\`\`\`bash
+dev up $client        # start Postgres + Redis
+npx trigger.dev@latest dev   # start Trigger.dev local tunnel
+\`\`\`
+EOF
+    info "Created CLAUDE.md at ${BOLD}$claude_md${RESET}"
+  fi
+
+  # ── 5. Add .env.local to .gitignore if not already there ─────
+  local gitignore="$project_dir/.gitignore"
+  if [[ ! -f "$gitignore" ]]; then
+    cat > "$gitignore" << EOF
+# Environment
+.env
+.env.local
+.env*.local
+
+# Dependencies
+node_modules/
+
+# Build
+dist/
+.next/
+
+# OS
+.DS_Store
+EOF
+    info "Created .gitignore"
+  elif ! grep -q ".env.local" "$gitignore" 2>/dev/null; then
+    echo ".env.local" >> "$gitignore"
+    info "Added .env.local to existing .gitignore"
+  fi
+
+  # ── Summary ───────────────────────────────────────────────────
+  echo ""
+  echo -e "${GREEN}${BOLD}✓ $client is ready${RESET}"
+  echo ""
+  echo -e "  ${BOLD}Docker${RESET}    $client_dir"
+  echo -e "  ${CYAN}Postgres${RESET}  localhost:${pg_port}  (${db_name})"
+  echo -e "  ${CYAN}Redis${RESET}     localhost:${redis_port}"
+  echo ""
+  echo -e "  ${BOLD}Project${RESET}   $project_dir"
+  echo -e "  ${CYAN}.env.local${RESET}      written with DATABASE_URL + REDIS_URL"
+  echo -e "  ${CYAN}CLAUDE.md${RESET}       created — fill in your architecture notes"
+  echo ""
+  echo -e "  ${BOLD}Next steps:${RESET}"
+  echo -e "  1. ${CYAN}dev up $client${RESET}               — start services"
+  echo -e "  2. ${CYAN}cd $project_dir${RESET}"
+  echo -e "  3. ${CYAN}npx trigger.dev@latest init${RESET}  — set up Trigger.dev"
+  echo -e "  4. Add your ${CYAN}TRIGGER_SECRET_KEY${RESET} to .env.local"
+  echo -e "  5. ${CYAN}claude .${RESET}                     — open in Claude Code"
+}
+
+cmd_logs() {
+  local client="$1"
+  require_client "$client"
+  client_compose "$client" logs -f
+}
+
+cmd_db() {
+  local client="$1"
+  require_client "$client"
+  load_env "$client"
+  info "Connecting to Postgres for ${BOLD}$client${RESET}..."
+  docker exec -it "${CLIENT_NAME}-postgres" psql -U "$DB_USER" -d "$DB_NAME"
+}
+
+cmd_redis() {
+  local client="$1"
+  require_client "$client"
+  load_env "$client"
+  info "Connecting to Redis for ${BOLD}$client${RESET}..."
+  docker exec -it "${CLIENT_NAME}-redis" redis-cli -a "$REDIS_PASSWORD"
+}
+
+cmd_nuke() {
+  local client="$1"
+  require_client "$client"
+  load_env "$client"
+  echo ""
+  warn "This will permanently delete ALL data for ${BOLD}$client${RESET}"
+  warn "Volumes to be deleted: ${CLIENT_NAME}-postgres-data, ${CLIENT_NAME}-redis-data"
+  echo ""
+  read -rp "Type client name to confirm: " confirm
+  [[ "$confirm" != "$client" ]] && error "Aborted — name did not match"
+
+  info "Removing all services and volumes for ${BOLD}$client${RESET}..."
+  client_compose "$client" down -v
+  success "All data for ${BOLD}$client${RESET} has been removed"
+}
+
+cmd_open() {
+  local client="$1"
+  [[ -z "$client" ]] && error "Client name required"
+  local project_dir="$PROJECTS_ROOT/$client"
+  [[ ! -d "$project_dir" ]] && error "Project folder not found: $project_dir"
+  info "Opening ${BOLD}$client${RESET} in VS Code..."
+  code "$project_dir"
+}
+
+cmd_ports() {
+  echo -e "\n${BOLD}Port Assignments${RESET}\n"
+  printf "  %-20s %-10s %-10s\n" "CLIENT" "POSTGRES" "REDIS"
+  printf "  %-20s %-10s %-10s\n" "──────────────────" "────────" "────────"
+  for dir in "$CLIENTS_DIR"/*/; do
+    local client
+    client=$(basename "$dir")
+    [[ "$client" == "template" ]] && continue
+    [[ ! -f "$dir/.env" ]] && continue
+    load_env "$client"
+    printf "  %-20s %-10s %-10s\n" "$client" ":${POSTGRES_PORT}" ":${REDIS_PORT}"
+  done
+  echo ""
+}
+
+# ── Usage ─────────────────────────────────────────────────────
+usage() {
+  echo -e "\n${BOLD}dev${RESET} — Docker client manager\n"
+  echo -e "  ${CYAN}dev new${RESET} <client>      Create Docker env + project folder + .env.local"
+  echo -e "  ${CYAN}dev up${RESET} <client>       Start services"
+  echo -e "  ${CYAN}dev down${RESET} <client>     Stop services (data preserved)"
+  echo -e "  ${CYAN}dev status${RESET}            Show all client service status"
+  echo -e "  ${CYAN}dev open${RESET} <client>     Open project in VS Code"
+  echo -e "  ${CYAN}dev logs${RESET} <client>     Follow service logs"
+  echo -e "  ${CYAN}dev db${RESET} <client>       Open psql shell"
+  echo -e "  ${CYAN}dev redis${RESET} <client>    Open redis-cli shell"
+  echo -e "  ${CYAN}dev nuke${RESET} <client>     Remove all data (destructive)"
+  echo -e "  ${CYAN}dev ports${RESET}             Show port assignments"
+  echo ""
+  echo -e "  ${BOLD}Config:${RESET} Projects root is ${CYAN}${PROJECTS_ROOT}${RESET}"
+  echo -e "  To change it, edit PROJECTS_ROOT in this script."
+  echo ""
+}
+
+# ── Dispatch ──────────────────────────────────────────────────
+CMD="${1:-help}"
+shift || true
+CLIENT="${1:-}"
+
+case "$CMD" in
+  up)     cmd_up "$CLIENT" ;;
+  down)   cmd_down "$CLIENT" ;;
+  status) cmd_status ;;
+  new)    cmd_new "$CLIENT" ;;
+  open)   cmd_open "$CLIENT" ;;
+  logs)   cmd_logs "$CLIENT" ;;
+  db)     cmd_db "$CLIENT" ;;
+  redis)  cmd_redis "$CLIENT" ;;
+  nuke)   cmd_nuke "$CLIENT" ;;
+  ports)  cmd_ports ;;
+  *)      usage ;;
+esac

@@ -1,0 +1,11 @@
+**/.DS_Store
+*.swp
+*.orig
+.idea/
+.vscode/
+**/.env
+**/.env.local
+**/.env.*.local
+**/*-workspace/
+**/iteration-*/
+**/__pycache__/
